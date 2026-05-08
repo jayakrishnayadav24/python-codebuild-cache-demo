@@ -122,7 +122,7 @@ Resources:
         BuildSpec: buildspec.yml
       Cache:
         Type: S3
-        Location: !Sub "python-demo-cache-${AWS::AccountId}/pip-cache/production-app"
+        Location: !Sub "python-demo-cache-${AWS::AccountId}/venv-cache/production-app"
       LogsConfig:
         CloudWatchLogs:
           Status: ENABLED

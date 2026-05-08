@@ -5,21 +5,33 @@ phases:
     runtime-versions:
       python: 3.11
     commands:
-      - echo "=== Installing dependencies ==="
+      - echo "=== Checking cache ==="
       - date
-      - pip install --no-deps -r requirements-heavy.txt
-      - pip install -r requirements.txt
-      - echo "=== All deps installed ==="
+      - REQUIREMENTS_HASH=$(md5sum requirements.txt requirements-heavy.txt | md5sum | cut -d' ' -f1)
+      - echo "Requirements hash $REQUIREMENTS_HASH"
+      - |
+        if [ -d "/root/venv" ] && [ -f "/root/venv/.hash" ] && [ "$(cat /root/venv/.hash)" = "$REQUIREMENTS_HASH" ]; then
+          echo "Cache HIT - virtualenv is valid, skipping install"
+        else
+          echo "Cache MISS - requirements changed or first build, installing..."
+          rm -rf /root/venv
+          python -m venv /root/venv
+          /root/venv/bin/pip install --upgrade pip
+          /root/venv/bin/pip install -r requirements-heavy.txt
+          /root/venv/bin/pip install -r requirements.txt
+          echo "$REQUIREMENTS_HASH" > /root/venv/.hash
+        fi
+      - echo "=== Done ==="
       - date
   pre_build:
     commands:
       - echo "Pre-build started on `date`"
-      - python --version
-      - pip list | wc -l
+      - /root/venv/bin/python --version
+      - /root/venv/bin/pip list | wc -l
   build:
     commands:
       - echo "Build started on `date`"
-      - pytest tests/ --tb=short || true
+      - /root/venv/bin/pytest tests/ --tb=short || true
   post_build:
     commands:
       - echo "Build completed on `date`"
@@ -34,4 +46,4 @@ artifacts:
 
 cache:
   paths:
-    - '/root/.cache/pip/**/*'
+    - '/root/venv/**/*'

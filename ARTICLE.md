@@ -1,6 +1,6 @@
-# Speed Up Python Builds in AWS CodePipeline Using CodeBuild pip Cache
+# Speed Up Python Builds in AWS CodePipeline Using CodeBuild Caching
 
-## The Problem: pip Downloads Everything on Every Build
+## The Problem: pip Installs Everything on Every Build
 
 If you've run a production Python application through AWS CodePipeline, you've seen this on every single build:
 
@@ -14,41 +14,59 @@ Collecting pyspark==3.5.1
 ...
 ```
 
-A real production Python app with ML libraries, AWS SDK, FastAPI, databases, Kafka, and observability tools can easily have **80–100 packages** with a total download size of **2–4 GB**. On a fresh CodeBuild container (ephemeral — destroyed after every build), this happens from scratch every time.
+A real production Python app with ML libraries, AWS SDK, FastAPI, databases, Kafka, and observability tools can easily have **80–100 packages** with a total size of **2–4 GB**. On a fresh CodeBuild container (ephemeral — destroyed after every build), this happens from scratch every time.
 
-The fix: **cache the pip download cache between builds using CodeBuild's S3 cache**.
-
----
-
-## What Gets Cached
-
-pip stores downloaded wheel files and package metadata in `~/.cache/pip`. On a warm cache hit, pip skips the download entirely and installs directly from the local cache.
-
-By pointing CodeBuild's cache at `/root/.cache/pip/**/*`:
-1. **First build** — pip downloads everything, cache is saved to S3
-2. **Every build after** — cache is restored from S3, pip installs from local wheels
+There are **3 ways** to fix this, each with different tradeoffs. Let's go through all of them.
 
 ---
 
-## Project Setup: A Heavy Python Project
+## Approach 1: pip Wheel Cache (`/root/.cache/pip`)
 
-This is a real-world production Python app using:
+### How it works
 
-- **Web**: FastAPI, Uvicorn, Gunicorn, Flask, Django, HTTPX, aiohttp
-- **Databases**: SQLAlchemy, Alembic, psycopg2, asyncpg, Motor, PyMongo, Redis, Elasticsearch, Cassandra
-- **AWS**: boto3, botocore, aiobotocore, aws-lambda-powertools, aws-cdk-lib
-- **ML / Data Science**: TensorFlow, PyTorch, torchvision, Transformers, scikit-learn, XGBoost, LightGBM, CatBoost, NumPy, Pandas, SciPy, OpenCV
-- **Data Processing**: Apache Airflow, Celery, Kafka, PySpark, Dask, Ray, PyArrow
-- **API / Serialization**: Pydantic, gRPC, Protobuf, GraphQL, Marshmallow
-- **Auth / Security**: python-jose, passlib, cryptography, PyJWT, Authlib
-- **Observability**: Prometheus, OpenTelemetry, Sentry, Datadog, structlog
-- **Testing**: pytest, moto, factory-boy, Faker, localstack-client
+pip stores downloaded wheel files in `/root/.cache/pip`. By caching this directory in S3, the next build skips downloading but still runs `pip install` to extract and install the wheels.
 
-Without caching, `pip install -r requirements.txt` on this project downloads **2–4 GB** on every build.
+```yaml
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'
+```
+
+### What it saves
+
+- ✅ Skips downloading packages from PyPI
+- ❌ Still runs `pip install` on every build (extracts wheels, resolves deps)
+- ❌ Large ML wheels (torch=779MB, tensorflow=589MB) make the S3 cache itself huge — unarchiving can take as long as downloading
+
+### Build time comparison
+
+| Scenario | Build Time |
+|---|---|
+| No cache | ~15–20 min |
+| pip wheel cache (warm) | ~8–12 min |
+| Savings | ~30–40% |
+
+### When to use
+
+Good for projects with small-to-medium dependencies. Not ideal for ML-heavy projects where wheel files are hundreds of MB each.
 
 ---
 
-## The buildspec.yml — The Key Part
+## Approach 2: Virtualenv Cache with Hash Invalidation (`/root/venv`)
+
+### How it works
+
+Instead of caching downloaded wheels, cache the **fully installed virtualenv**. On a cache hit, skip `pip install` entirely — just use the restored venv directly.
+
+The key addition is a **hash check**: compute an MD5 of your `requirements.txt` files and store it in the venv. If the hash matches on the next build, the requirements haven't changed — use the cache. If the hash differs, rebuild the venv from scratch.
+
+```yaml
+cache:
+  paths:
+    - '/root/venv/**/*'
+```
+
+### The buildspec.yml
 
 ```yaml
 version: 0.2
@@ -58,14 +76,27 @@ phases:
     runtime-versions:
       python: 3.11
     commands:
-      - pip install --upgrade pip
-      - pip install -r requirements.txt
+      - REQUIREMENTS_HASH=$(md5sum requirements.txt requirements-heavy.txt | md5sum | cut -d' ' -f1)
+      - echo "Requirements hash $REQUIREMENTS_HASH"
+      - |
+        if [ -d "/root/venv" ] && [ -f "/root/venv/.hash" ] && [ "$(cat /root/venv/.hash)" = "$REQUIREMENTS_HASH" ]; then
+          echo "Cache HIT - virtualenv is valid, skipping install"
+        else
+          echo "Cache MISS - requirements changed or first build, installing..."
+          rm -rf /root/venv
+          python -m venv /root/venv
+          /root/venv/bin/pip install --upgrade pip
+          /root/venv/bin/pip install -r requirements-heavy.txt
+          /root/venv/bin/pip install -r requirements.txt
+          echo "$REQUIREMENTS_HASH" > /root/venv/.hash
+        fi
   pre_build:
     commands:
-      - python --version
+      - /root/venv/bin/python --version
+      - /root/venv/bin/pip list | wc -l
   build:
     commands:
-      - pytest tests/ --tb=short || true
+      - /root/venv/bin/pytest tests/ --tb=short || true
   post_build:
     commands:
       - echo "Build completed on `date`"
@@ -76,28 +107,109 @@ artifacts:
 
 cache:
   paths:
-    - '/root/.cache/pip/**/*'    # <-- This is the magic line
+    - '/root/venv/**/*'
 ```
 
-The difference from Maven: pip's cache is at `/root/.cache/pip`, not `~/.m2`. Everything else works identically.
+### What it saves
+
+- ✅ Skips `pip install` entirely on cache hit
+- ✅ Hash check auto-invalidates when requirements change
+- ✅ Fastest warm build time
+- ⚠️ Venv contains absolute paths — if CodeBuild changes the Python version or container, venv may break
+- ⚠️ Full venv can be 2–3 GB in S3
+
+### Build time comparison
+
+| Scenario | Build Time |
+|---|---|
+| No cache (cold) | ~15–20 min |
+| venv cache (warm, no requirements change) | ~1–2 min |
+| venv cache (warm, requirements changed) | ~15–20 min (rebuilds) |
+| Savings on warm hit | **~85–90%** |
+
+### When to use
+
+Best for teams where requirements change infrequently (e.g., stable ML projects). The hash check ensures correctness — if you add a new package, the next build automatically detects the change and rebuilds the venv.
 
 ---
 
-## Configuring the Cache in CodeBuild / CloudFormation
+## Approach 3: Custom Docker Image in ECR (Production Best Practice)
 
-The full `pipeline.yml` CloudFormation template provisions:
-- S3 bucket for build artifacts (30-day lifecycle)
-- S3 bucket for pip cache (30-day lifecycle)
-- IAM roles for CodeBuild and CodePipeline
-- CodeBuild project with S3 cache at `pip-cache/production-app`
-- CodePipeline with GitHub source via CodeStar Connection
+### How it works
 
-Key section in the CodeBuild project:
+Build a custom Docker image with all heavy dependencies pre-installed, push it to Amazon ECR, and configure CodeBuild to use that image. Zero install time on every build.
+
+```dockerfile
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+
+RUN pip install tensorflow torch torchvision pyspark \
+    xgboost lightgbm scikit-learn pandas numpy \
+    fastapi uvicorn sqlalchemy boto3 celery kafka-python \
+    # ... all your deps
+```
 
 ```yaml
-Cache:
-  Type: S3
-  Location: !Sub "python-demo-cache-${AWS::AccountId}/pip-cache/production-app"
+# In CodeBuild project
+Environment:
+  Type: LINUX_CONTAINER
+  Image: <account>.dkr.ecr.us-east-1.amazonaws.com/python-build:latest
+```
+
+### What it saves
+
+- ✅ Zero install time — packages already in the image
+- ✅ Fully reproducible — same image = same environment
+- ✅ No cache invalidation issues
+- ❌ Need to rebuild and push the Docker image when dependencies change
+- ❌ Adds complexity (ECR repo, image build pipeline)
+
+### When to use
+
+Production teams with stable, large dependency trees. The overhead of maintaining a custom image pays off when you have 50+ builds per day.
+
+---
+
+## Comparison: All 3 Approaches
+
+| | pip Wheel Cache | venv Cache | Custom Docker (ECR) |
+|---|---|---|---|
+| Cold build | ~15–20 min | ~15–20 min | ~1–2 min (always) |
+| Warm build | ~8–12 min | ~1–2 min | ~1–2 min |
+| Auto-invalidation | ✅ (additive) | ✅ (hash check) | ❌ (manual rebuild) |
+| Complexity | Low | Medium | High |
+| Best for | Small/medium deps | ML projects, stable deps | Large teams, many builds |
+
+---
+
+## Project Setup: A Heavy Python Project
+
+This demo uses a real-world production Python app with:
+
+- **Web**: FastAPI, Uvicorn, Gunicorn, HTTPX, aiohttp
+- **Databases**: SQLAlchemy, Alembic, psycopg2, asyncpg, Motor, PyMongo, Redis, Elasticsearch, Cassandra
+- **AWS**: boto3, aiobotocore, aws-lambda-powertools, aws-cdk-lib
+- **ML / Data Science**: TensorFlow, PyTorch, Transformers, scikit-learn, XGBoost, LightGBM, CatBoost, NumPy, Pandas, OpenCV
+- **Data Processing**: Celery, Kafka, PySpark, Dask, PyArrow
+- **API / Serialization**: Pydantic, gRPC, GraphQL, Marshmallow
+- **Auth / Security**: python-jose, passlib, PyJWT, Authlib
+- **Observability**: Prometheus, OpenTelemetry, Sentry, Datadog, structlog
+- **Testing**: pytest, moto, factory-boy, Faker, localstack-client
+
+---
+
+## Configuring the Cache in CloudFormation
+
+The `pipeline.yml` template provisions everything — S3 buckets, IAM roles, CodeBuild with cache, and CodePipeline connected to GitHub.
+
+Key section for venv cache:
+
+```yaml
+CodeBuildProject:
+  Type: AWS::CodeBuild::Project
+  Properties:
+    Cache:
+      Type: S3
+      Location: !Sub "python-demo-cache-${AWS::AccountId}/venv-cache/production-app"
 ```
 
 ---
@@ -130,100 +242,26 @@ aws cloudformation delete-stack \
 
 ---
 
-## How the Cache Flow Works
-
-```
-Git push to main
-       │
-       ▼
-CodePipeline triggers
-       │
-       ▼
-CodeBuild starts
-       │
-       ▼
-Restore cache from S3
-/root/.cache/pip ← s3://python-demo-cache-<account>/pip-cache/production-app
-       │
-       ▼
-pip install -r requirements.txt
-(installs from local wheels, skips downloads)
-       │
-       ▼
-Run tests
-       │
-       ▼
-Save updated cache back to S3
-       │
-       ▼
-Upload artifact to S3
-```
-
----
-
-## Real Build Time Comparison
-
-| Scenario | pip Download Time | Total Build Time |
-|---|---|---|
-| No cache (cold start) | ~10–15 minutes | ~15–20 minutes |
-| With S3 cache (warm) | ~20–40 seconds | ~2–4 minutes |
-| Savings | **~12 minutes per build** | **~75–80% faster** |
-
-Python builds save even more time than Java/Maven because ML libraries like TensorFlow and PyTorch are massive (500–800 MB each).
-
----
-
-## Maven vs pip Cache: Key Differences
-
-| | Maven (Java) | pip (Python) |
-|---|---|---|
-| Cache path | `/root/.m2/**/*` | `/root/.cache/pip/**/*` |
-| Typical cold download | ~500 MB – 1.5 GB | ~2–4 GB |
-| Warm build savings | ~60–70% | ~75–80% |
-| Cache invalidation | Delete S3 prefix | Delete S3 prefix |
-
----
-
 ## Cache Invalidation
 
-pip's cache is additive just like Maven's. To force a clean download:
+**venv cache** — automatic via hash check. If `requirements.txt` changes, the next build detects it and rebuilds:
+```
+Requirements hash abc123 != def456 → Cache MISS → rebuilding venv
+```
 
+**Manual invalidation** (force full rebuild):
 ```bash
-aws s3 rm s3://python-demo-cache-<account-id>/pip-cache/production-app --recursive
+aws s3 rm s3://python-demo-cache-<account-id>/venv-cache/production-app --recursive
 ```
-
-The next build does a full cold download and repopulates the cache.
-
----
-
-## Pro Tips
-
-**1. Pin all versions in requirements.txt**
-Unpinned versions cause cache misses because pip re-resolves dependencies every time.
-
-**2. Use `--no-deps` for known-stable packages**
-For packages you know won't change, `pip install --no-deps` skips dependency resolution entirely.
-
-**3. Split requirements files**
-```
-requirements-base.txt    ← stable heavy deps (torch, tensorflow) — rarely changes
-requirements.txt         ← app deps — changes frequently
-```
-Cache `requirements-base.txt` installs separately so a change in app deps doesn't invalidate the heavy ML library cache.
-
-**4. Use `BUILD_GENERAL1_LARGE` for ML projects**
-TensorFlow and PyTorch need more memory during installation. `LARGE` compute (7 GB RAM) prevents OOM kills during pip install.
 
 ---
 
 ## Summary
 
-| What | How |
-|---|---|
-| What to cache | `/root/.cache/pip/**/*` |
-| Cache type | Amazon S3 |
-| Where to configure | `buildspec.yml` → `cache.paths` + CodeBuild project cache settings |
-| Time saved | 75–80% faster builds on warm cache |
-| Cache invalidation | Delete S3 prefix manually |
+For Python projects in AWS CodePipeline, use the approach that matches your team:
 
-For Python projects with ML dependencies, this is the single highest-impact CI/CD optimization you can make. TensorFlow and PyTorch alone are over 1 GB — downloading them on every build is pure waste.
+- **Getting started** → pip wheel cache (`/root/.cache/pip`) — 3 lines in buildspec
+- **ML/heavy projects** → venv cache with hash check — best balance of speed and correctness
+- **Large teams, many builds** → Custom Docker image in ECR — zero install time always
+
+The venv cache with hash invalidation is the sweet spot for most production Python projects. It gives you near-zero install time on warm builds while automatically handling requirements changes correctly.
