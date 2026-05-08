@@ -1,5 +1,11 @@
 # These are NOT pre-installed in CodeBuild standard:7.0 - safe to install
-# All versions are latest to avoid downgrade conflicts
+
+# Web Framework
+fastapi
+uvicorn[standard]
+gunicorn
+httpx
+aiohttp
 
 # Database / ORM
 sqlalchemy
