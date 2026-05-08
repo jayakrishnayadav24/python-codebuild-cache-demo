@@ -1,16 +1,9 @@
-# Heavy ML / Data Science - exact pins to avoid resolver backtracking
-numpy==1.26.4
-pandas==2.2.3
-scipy==1.15.2
-scikit-learn==1.6.1
-xgboost==2.1.4
-lightgbm==4.6.0
-tensorflow==2.16.1
-torch==2.3.0
-torchvision==0.18.0
-transformers==4.41.1
-datasets==2.19.1
-huggingface-hub==0.23.2
-opencv-python==4.9.0.80
-pyspark==3.5.1
-pyarrow==16.1.0
+# Heavy ML packages - no version pins, use latest compatible
+# Pre-installed in CodeBuild: numpy, pandas, scipy, scikit-learn, torch, tensorflow, transformers
+# Only install what's missing
+xgboost
+lightgbm
+datasets
+huggingface-hub
+pyarrow
+pyspark
