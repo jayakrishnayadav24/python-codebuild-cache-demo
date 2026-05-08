@@ -61,7 +61,7 @@ pydantic==2.11.1
 pydantic-settings==2.8.1
 marshmallow==3.26.1
 graphene==3.4.3
-strawberry-graphql==0.261.2
+strawberry-graphql==0.261.0
 grpcio==1.71.0
 protobuf==4.25.6
 
