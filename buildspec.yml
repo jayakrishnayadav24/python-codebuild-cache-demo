@@ -5,18 +5,24 @@ phases:
     runtime-versions:
       python: 3.11
     commands:
-      - echo "Installing dependencies..."
+      - echo "=== Installing heavy ML dependencies ==="
+      - date
       - pip install --upgrade pip
+      - pip install -r requirements-heavy.txt
+      - echo "=== Heavy deps done ==="
+      - date
+      - echo "=== Installing app dependencies ==="
       - pip install -r requirements.txt
+      - echo "=== All deps installed ==="
+      - date
   pre_build:
     commands:
       - echo "Pre-build started on `date`"
       - python --version
-      - pip --version
+      - pip list | wc -l
   build:
     commands:
       - echo "Build started on `date`"
-      - pip install pytest pytest-cov
       - pytest tests/ --tb=short || true
   post_build:
     commands:
